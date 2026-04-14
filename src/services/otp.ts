@@ -14,33 +14,8 @@ export async function sendOTP(email: string): Promise<string> {
     [email, code, expiresAt]
   );
 
-  // Resend HTTP API вместо SMTP
-  const res = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${process.env.SMTP_PASS}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      from: process.env.FROM_EMAIL || 'onboarding@resend.dev',
-      to: email,
-      subject: 'Код подтверждения',
-      html: `
-        <div style="font-family: sans-serif; max-width: 400px; margin: 0 auto;">
-          <h2>Ваш код подтверждения</h2>
-          <div style="font-size: 36px; font-weight: bold; letter-spacing: 8px; color: #6366f1; padding: 20px 0;">
-            ${code}
-          </div>
-          <p>Код действует 10 минут.</p>
-        </div>
-      `,
-    }),
-  });
-
-  if (!res.ok) {
-    const err = await res.json();
-    throw new Error(`Resend error: ${JSON.stringify(err)}`);
-  }
+  // Временно логируем код в консоль
+  console.log(`[OTP] ${email} → ${code}`);
 
   return code;
 }
