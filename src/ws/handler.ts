@@ -7,17 +7,13 @@ interface AuthenticatedWS extends WebSocket {
   chatIds?: Set<string>;
 }
 
-// userId -> Set of WebSocket connections
 const clients = new Map<string, Set<AuthenticatedWS>>();
 
 export function setupWebSocket(wss: WebSocketServer) {
   wss.on('connection', (ws: AuthenticatedWS, req) => {
     const token = new URL(req.url!, `http://localhost`).searchParams.get('token');
 
-    if (!token) {
-      ws.close(1008, 'Unauthorized');
-      return;
-    }
+    if (!token) { ws.close(1008, 'Unauthorized'); return; }
 
     try {
       const decoded = jwt.verify(token, process.env.JWT_SECRET!) as { userId: string };
@@ -26,6 +22,9 @@ export function setupWebSocket(wss: WebSocketServer) {
 
       if (!clients.has(ws.userId)) clients.set(ws.userId, new Set());
       clients.get(ws.userId)!.add(ws);
+
+      // Ставим онлайн
+      setOnlineStatus(ws.userId, true);
 
       ws.send(JSON.stringify({ type: 'connected', userId: ws.userId }));
     } catch {
@@ -45,19 +44,49 @@ export function setupWebSocket(wss: WebSocketServer) {
     ws.on('close', () => {
       if (ws.userId) {
         clients.get(ws.userId)?.delete(ws);
-        if (clients.get(ws.userId)?.size === 0) clients.delete(ws.userId);
+        if (clients.get(ws.userId)?.size === 0) {
+          clients.delete(ws.userId);
+          setOnlineStatus(ws.userId, false);
+        }
       }
     });
   });
+}
+
+async function setOnlineStatus(userId: string, online: boolean) {
+  await query(
+    `UPDATE users SET is_online = $1, last_seen_at = NOW() WHERE id = $2`,
+    [online, userId]
+  );
+  // Уведомить контакты об изменении статуса
+  const contacts = await query(
+    `SELECT owner_id FROM contacts WHERE contact_id = $1
+     UNION
+     SELECT contact_id FROM contacts WHERE owner_id = $1`,
+    [userId]
+  );
+  for (const row of contacts.rows) {
+    const contactClients = clients.get(row.owner_id || row.contact_id);
+    if (contactClients) {
+      for (const c of contactClients) {
+        if (c.readyState === WebSocket.OPEN) {
+          c.send(JSON.stringify({ type: 'user_status', userId, online }));
+        }
+      }
+    }
+  }
 }
 
 async function handleMessage(ws: AuthenticatedWS, msg: any) {
   const { type, payload } = msg;
 
   switch (type) {
-    // Fix: handle ping — не крашим сервер
     case 'ping': {
       ws.send(JSON.stringify({ type: 'pong' }));
+      // Обновляем last_seen при пинге
+      if (ws.userId) {
+        await query('UPDATE users SET last_seen_at = NOW() WHERE id = $1', [ws.userId]);
+      }
       break;
     }
 
@@ -75,15 +104,17 @@ async function handleMessage(ws: AuthenticatedWS, msg: any) {
     }
 
     case 'send_message': {
-      const { chatId, content, replyTo } = payload;
+      const { chatId, content, replyTo, type: msgType, mediaUrl, mediaMime, mediaSize, mediaDuration } = payload;
       if (!ws.chatIds?.has(chatId)) {
         ws.send(JSON.stringify({ type: 'error', message: 'Сначала войдите в чат' }));
         return;
       }
 
       const result = await query(
-        `INSERT INTO messages (chat_id, sender_id, content, reply_to) VALUES ($1, $2, $3, $4) RETURNING *`,
-        [chatId, ws.userId, content, replyTo || null]
+        `INSERT INTO messages (chat_id, sender_id, content, reply_to, type, media_url, media_mime, media_size, media_duration)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+        [chatId, ws.userId, content, replyTo || null,
+         msgType || 'text', mediaUrl || null, mediaMime || null, mediaSize || null, mediaDuration || null]
       );
 
       const messageRow = result.rows[0];
@@ -94,6 +125,21 @@ async function handleMessage(ws: AuthenticatedWS, msg: any) {
       );
       const user = userResult.rows[0];
 
+      // Если есть reply, подгрузить
+      let replyContent = null, replySender = null, replyMediaUrl = null;
+      if (replyTo) {
+        const replyResult = await query(
+          `SELECT m.content, m.media_url, u.display_name FROM messages m
+           JOIN users u ON u.id = m.sender_id WHERE m.id = $1`,
+          [replyTo]
+        );
+        if (replyResult.rows.length > 0) {
+          replyContent = replyResult.rows[0].content;
+          replySender = replyResult.rows[0].display_name;
+          replyMediaUrl = replyResult.rows[0].media_url;
+        }
+      }
+
       const outMessage = {
         type: 'new_message',
         message: {
@@ -101,6 +147,11 @@ async function handleMessage(ws: AuthenticatedWS, msg: any) {
           username: user.username,
           display_name: user.display_name,
           avatar_url: user.avatar_url,
+          reply_content: replyContent,
+          reply_sender: replySender,
+          reply_media_url: replyMediaUrl,
+          reactions: [],
+          read_count: 0,
         },
       };
 
@@ -121,11 +172,20 @@ async function handleMessage(ws: AuthenticatedWS, msg: any) {
     }
 
     case 'mark_read': {
-      const { chatId } = payload;
+      const { chatId, messageId } = payload;
       await query(
         `UPDATE chat_members SET last_read_at = NOW() WHERE chat_id = $1 AND user_id = $2`,
         [chatId, ws.userId]
       );
+
+      // Отметить конкретное сообщение как прочитанное
+      if (messageId) {
+        await query(
+          `INSERT INTO message_reads (message_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+          [messageId, ws.userId]
+        );
+        await broadcastToChat(chatId, { type: 'message_read', messageId, userId: ws.userId }, ws.userId);
+      }
       break;
     }
 
@@ -142,7 +202,7 @@ async function handleMessage(ws: AuthenticatedWS, msg: any) {
     case 'edit_message': {
       const { messageId, chatId, content } = payload;
       const result = await query(
-        `UPDATE messages SET content = $1, edited_at = NOW() 
+        `UPDATE messages SET content = $1, edited_at = NOW()
          WHERE id = $2 AND sender_id = $3 RETURNING *`,
         [content, messageId, ws.userId]
       );
@@ -151,11 +211,77 @@ async function handleMessage(ws: AuthenticatedWS, msg: any) {
       }
       break;
     }
+
+    case 'react': {
+      const { chatId, messageId, emoji } = payload;
+
+      const existing = await query(
+        'SELECT id FROM message_reactions WHERE message_id = $1 AND user_id = $2 AND emoji = $3',
+        [messageId, ws.userId, emoji]
+      );
+
+      let added: boolean;
+      if (existing.rows.length > 0) {
+        await query('DELETE FROM message_reactions WHERE id = $1', [existing.rows[0].id]);
+        added = false;
+      } else {
+        await query(
+          'INSERT INTO message_reactions (message_id, user_id, emoji) VALUES ($1, $2, $3)',
+          [messageId, ws.userId, emoji]
+        );
+        added = true;
+      }
+
+      // Получаем актуальные реакции
+      const reactions = await query(
+        `SELECT emoji, COUNT(*) as count FROM message_reactions WHERE message_id = $1 GROUP BY emoji`,
+        [messageId]
+      );
+
+      await broadcastToChat(chatId, {
+        type: 'reaction_update',
+        messageId,
+        reactions: reactions.rows,
+        userId: ws.userId,
+        emoji,
+        added,
+      });
+      break;
+    }
+
+    case 'forward_message': {
+      const { fromChatId, messagId, toChatId } = payload;
+
+      const access = await query(
+        'SELECT 1 FROM chat_members WHERE chat_id = $1 AND user_id = $2',
+        [toChatId, ws.userId]
+      );
+      if (access.rows.length === 0) return;
+
+      const orig = await query('SELECT * FROM messages WHERE id = $1', [messagId]);
+      if (orig.rows.length === 0) return;
+
+      const fwd = orig.rows[0];
+      const result = await query(
+        `INSERT INTO messages (chat_id, sender_id, content, type, media_url, media_mime, forwarded_from)
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+        [toChatId, ws.userId, fwd.content, fwd.type, fwd.media_url, fwd.media_mime, fwd.id]
+      );
+
+      const userResult = await query(
+        'SELECT username, display_name, avatar_url FROM users WHERE id = $1',
+        [ws.userId]
+      );
+
+      await broadcastToChat(toChatId, {
+        type: 'new_message',
+        message: { ...result.rows[0], ...userResult.rows[0], reactions: [] },
+      });
+      break;
+    }
   }
 }
 
-// Fix: кешируем участников чата в памяти для broadcast
-// вместо SQL-запроса на каждое сообщение используем clients map
 async function broadcastToChat(chatId: string, data: any, excludeUserId?: string) {
   const members = await query(
     'SELECT user_id FROM chat_members WHERE chat_id = $1',
