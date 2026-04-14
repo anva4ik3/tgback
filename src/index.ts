@@ -3,6 +3,8 @@ import cors from 'cors';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import dotenv from 'dotenv';
+import fs from 'fs';
+import path from 'path';
 dotenv.config();
 
 import { pool } from './db';
@@ -41,8 +43,14 @@ server.listen(PORT, async () => {
   try {
     await pool.query('SELECT 1');
     console.log(`✅ DB connected`);
+
+    // Run migrations
+    const sqlPath = path.join(__dirname, '..', 'migrations', 'init.sql');
+    const sql = fs.readFileSync(sqlPath, 'utf-8');
+    await pool.query(sql);
+    console.log(`✅ Migrations applied`);
   } catch (err) {
-    console.error('❌ DB connection failed:', err);
+    console.error('❌ Startup error:', err);
   }
   console.log(`🚀 Server running on port ${PORT}`);
 });
